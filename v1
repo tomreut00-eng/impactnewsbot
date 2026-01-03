@@ -1,0 +1,922 @@
+export default {
+  async scheduled(event, env, ctx) {
+    // Weekly: Sunday 12:00 UTC (see wrangler.toml)
+    if (event.cron === "0 12 * * SUN") {
+      ctx.waitUntil(runWeekly(env));
+      return;
+    }
+
+    ctx.waitUntil(runTick(env));
+  },
+
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // Telegram webhook
+    if (url.pathname === "/tg") {
+      const update = await request.json().catch(() => null);
+      if (update) ctx.waitUntil(handleTelegramUpdate(env, update));
+      return new Response("OK");
+    }
+
+    if (url.pathname === "/health") return new Response("OK");
+    return new Response("Not found", { status: 404 });
+  }
+};
+
+/* =========================================================
+   CONFIG
+========================================================= */
+
+const PERPLEXITY_SEARCH_URL = "https://api.perplexity.ai/search";
+const PERPLEXITY_CHAT_URL   = "https://api.perplexity.ai/chat/completions";
+
+const SONAR_MODEL = "sonar-pro";
+const SONAR_SEARCH_CONTEXT_SIZE = "low";
+const SONAR_SEARCH_TYPE = "fast";
+
+const SEEN_TTL_SECONDS = 72 * 60 * 60;
+const KV_PREFIX_SEEN = "seen:";
+const KV_PREFIX_HIGH_SENT = "high_sent:";
+
+const KV_WEEKLY_TEXT = "weekly:last_text";
+
+const USER_PREFIX = "user:";   // USERS_KV key: user:<telegram_user_id>
+const USER_INDEX  = "user_index";
+
+const OFF_SESSION_DIGEST_MIN = 240; // 4h
+const IN_SESSION_DIGEST_MIN  = 30;  // 30m
+
+// Anti-spam for HIGH: still can repeat if new link; but same link won't repeat for 72h.
+const MAX_RESULTS_PER_QUERY = 6;
+
+/* =========================================================
+   USER PREFS (regions + crypto + ETF only)
+========================================================= */
+
+const DEFAULT_PREFS = {
+  chatId: null,
+  regions: { AMERICAS: true, EUROPE: false, UK: false, ASIA: false },
+  crypto:  { BTC: true, ETH: true, XRP: false, SOL: false, BNB: false, USDT: false, ALTS: true }, // ALTS = HIGH only
+  etf:     { BTCETF: true, ETHETF: true },
+  lastSentTs: { digest: 0, high: 0, weekly: 0 }
+};
+
+/* =========================================================
+   REGION / CRYPTO / ETF QUERIES (pooled per tick)
+   NOTE: Regions are not "SPX only" – they are macro/market-moving.
+========================================================= */
+
+const REGION_QUERIES = {
+  AMERICAS: [
+    "US macro news CPI PCE NFP FOMC Fed Powell Treasury auction yields market moving headlines",
+    "US equities futures S&P 500 Nasdaq major earnings guidance downgrades upgrades market moving news",
+    "US dollar DXY USD risk-on risk-off VIX volatility market moving news"
+  ],
+  EUROPE: [
+    "Eurozone Europe markets macro news ECB rate decision inflation PMI market moving headlines",
+    "Germany DAX futures market moving news earnings guidance"
+  ],
+  UK: [
+    "UK markets macro news BOE rate decision inflation jobs GDP market moving headlines",
+    "FTSE 100 UKX market moving earnings guidance"
+  ],
+  ASIA: [
+    "Japan BOJ yen intervention inflation market moving headlines",
+    "Nikkei 225 Japan equities market moving news Asia markets risk sentiment"
+  ]
+};
+
+const CRYPTO_QUERIES = {
+  BTC:  "Bitcoin BTC news ETF flows regulation exchange inflows outflows macro impact",
+  ETH:  "Ethereum ETH news ETF flows staking upgrade regulation macro impact",
+  XRP:  "XRP Ripple news SEC lawsuit settlement regulation",
+  SOL:  "Solana SOL news outages upgrades ecosystem major moves",
+  BNB:  "BNB Binance news regulation compliance exchange",
+  USDT: "Tether USDT stablecoin news reserves regulation depeg",
+  ALTS: "altcoins major news hack exploit depeg liquidation SEC ETF listing delisting exchange outage"
+};
+
+const ETF_QUERIES = {
+  BTCETF: "spot Bitcoin ETF flows IBIT FBTC ARKB net inflows outflows SEC filings",
+  ETHETF: "spot Ethereum ETF flows net inflows outflows SEC filings"
+};
+
+/* =========================================================
+   SCORING (impact)
+========================================================= */
+
+const SOURCE_WEIGHTS = [
+  { pattern: /reuters\.com/i, w: 10 },
+  { pattern: /bloomberg\.com/i, w: 10 },
+  { pattern: /ft\.com/i, w: 9 },
+  { pattern: /wsj\.com/i, w: 9 },
+  { pattern: /cnbc\.com/i, w: 7 },
+
+  { pattern: /sec\.gov/i, w: 10 },
+  { pattern: /federalreserve\.gov/i, w: 10 },
+  { pattern: /ecb\.europa\.eu/i, w: 9 },
+  { pattern: /bankofengland\.co\.uk/i, w: 9 },
+  { pattern: /boj\.or\.jp/i, w: 9 },
+  { pattern: /cmegroup\.com/i, w: 9 },
+  { pattern: /treasury\.gov/i, w: 9 },
+
+  { pattern: /coindesk\.com/i, w: 6 },
+  { pattern: /theblock\.co/i, w: 6 }
+];
+
+const KEYWORD_WEIGHTS = [
+  { pattern: /\bCPI\b|\bPCE\b|\bNFP\b|\bFOMC\b|\bFed\b|\bPowell\b/i, w: 6 },
+  { pattern: /\bECB\b|\bBOE\b|\bBOJ\b|\brate decision\b|\bmeeting\b/i, w: 5 },
+  { pattern: /\bTreasury auction\b|\b10-?year\b|\byield(s)?\b|\brates?\b/i, w: 4 },
+  { pattern: /\bearnings\b|\bguidance\b|\bprofit warning\b/i, w: 4 },
+  { pattern: /\bSEC\b|\bETF\b|\bS-1\b|\b13F\b|\bfiling(s)?\b/i, w: 5 },
+  { pattern: /\bhack\b|\bexploit\b|\boutage\b|\bdepeg\b|\bliquidation(s)?\b/i, w: 5 },
+  { pattern: /\bgeopolitic|\bsanction|\bwar|\bconflict\b/i, w: 4 },
+];
+
+function scoreSource(url) {
+  let s = 0;
+  for (const r of SOURCE_WEIGHTS) if (r.pattern.test(url)) s += r.w;
+  return s;
+}
+function scoreKeywords(text) {
+  let s = 0;
+  for (const r of KEYWORD_WEIGHTS) if (r.pattern.test(text)) s += r.w;
+  return s;
+}
+function impactLabel(score) {
+  if (score >= 14) return "HIGH";
+  if (score >= 8) return "MED";
+  return "LOW";
+}
+
+/* =========================================================
+   MAIN TICK (optimized pooled search + per-user routing)
+   - HIGH -> immediate (per tick), regardless of digest schedule
+   - Digest -> every 4h off-session / 30m NY, if news exist
+========================================================= */
+
+async function runTick(env) {
+  const now = Date.now();
+  const session = getNySessionInfo(now);
+
+  const userIds = await getUserIndex(env);
+  if (userIds.length === 0) return;
+
+  // 1) Load users + build union subscriptions
+  const users = [];
+  const union = {
+    regions: { AMERICAS:false, EUROPE:false, UK:false, ASIA:false },
+    crypto:  { BTC:false, ETH:false, XRP:false, SOL:false, BNB:false, USDT:false, ALTS:false },
+    etf:     { BTCETF:false, ETHETF:false }
+  };
+
+  for (const uid of userIds) {
+    let prefs = await getUserPrefs(env, uid);
+    if (!prefs?.chatId) continue;
+
+    // normalize
+    prefs = normalizePrefs(prefs);
+
+    users.push({ uid, prefs });
+
+    for (const k of Object.keys(union.regions)) if (prefs.regions[k]) union.regions[k] = true;
+    for (const k of Object.keys(union.crypto))  if (prefs.crypto[k])  union.crypto[k]  = true;
+    for (const k of Object.keys(union.etf))     if (prefs.etf[k])     union.etf[k]     = true;
+  }
+
+  if (users.length === 0) return;
+
+  // 2) Build pooled queries (only those someone needs)
+  const pooledQueries = [];
+
+  for (const [region, on] of Object.entries(union.regions)) {
+    if (!on) continue;
+    for (const q of REGION_QUERIES[region]) pooledQueries.push({ tag: `REG_${region}`, query: q });
+  }
+
+  for (const [k, on] of Object.entries(union.crypto)) {
+    if (!on) continue;
+    pooledQueries.push({ tag: `CR_${k}`, query: CRYPTO_QUERIES[k] });
+  }
+
+  for (const [k, on] of Object.entries(union.etf)) {
+    if (!on) continue;
+    pooledQueries.push({ tag: `ETF_${k}`, query: ETF_QUERIES[k] });
+  }
+
+  if (pooledQueries.length === 0) return;
+
+  // 3) Fetch Search once (pooled)
+  const raw = [];
+  for (const q of pooledQueries) {
+    const results = await perplexitySearch(env, q.query, MAX_RESULTS_PER_QUERY);
+    for (const r of results) {
+      const it = normalizeResult(r, q.tag);
+      if (it?.url) raw.push(it);
+    }
+  }
+  if (raw.length === 0) return;
+
+  // 4) Global dedup + scoring (do NOT mark seen until actually sent)
+  const poolFresh = [];
+  for (const it of raw) {
+    const seenKey = KV_PREFIX_SEEN + stableHash(it.url);
+    if (await env.NEWS_KV.get(seenKey)) continue;
+
+    const s = scoreSource(it.url) + scoreKeywords(`${it.title} ${it.snippet || ""}`);
+    const impact = impactLabel(s);
+
+    // Altcoins: HIGH only
+    if (it.tag === "CR_ALTS" && impact !== "HIGH") continue;
+
+    poolFresh.push({ ...it, score: s, impact });
+  }
+  if (poolFresh.length === 0) return;
+
+  poolFresh.sort((a, b) => b.score - a.score);
+
+  // index pool by tag
+  const byTag = new Map();
+  for (const it of poolFresh) {
+    if (!byTag.has(it.tag)) byTag.set(it.tag, []);
+    byTag.get(it.tag).push(it);
+  }
+
+  // 5) Send logic
+  const sentUrls = new Set();
+
+  // 5A) HIGH immediate per item (dedup per link using high_sent)
+  const highItems = poolFresh.filter(x => x.impact === "HIGH");
+
+  for (const hi of highItems) {
+    const highKey = KV_PREFIX_HIGH_SENT + stableHash(hi.url);
+    if (await env.NEWS_KV.get(highKey)) continue;
+
+    for (const { uid, prefs } of users) {
+      if (!userWantsTag(prefs, hi.tag)) continue;
+
+      const alertText = await sonarRegionalMessage(env, {
+        session,
+        items: [hi],
+        mode: "high_alert"
+      });
+
+      await sendTelegram(env, prefs.chatId, alertText, mainMenuKeyboard(prefs));
+      prefs.lastSentTs.high = now;
+      await setUserPrefs(env, uid, prefs);
+    }
+
+    await env.NEWS_KV.put(highKey, "1", { expirationTtl: SEEN_TTL_SECONDS });
+    sentUrls.add(hi.url);
+  }
+
+  // 5B) Digest per user by schedule (NY 30m / off 4h) if there are items
+  for (const { uid, prefs } of users) {
+    const dueMin = session.inSession ? IN_SESSION_DIGEST_MIN : OFF_SESSION_DIGEST_MIN;
+    const deltaMin = (now - (prefs.lastSentTs.digest || 0)) / 60000;
+    if (deltaMin < dueMin) continue;
+
+    const userItems = collectUserItems(prefs, byTag);
+    // remove HIGH (already pushed)
+    const nonHigh = userItems.filter(x => x.impact !== "HIGH");
+
+    // In NY: we can avoid LOW spam (optional). Keep only MED/HIGH in-session.
+    const candidate = session.inSession ? nonHigh.filter(x => x.impact !== "LOW") : nonHigh;
+
+    if (candidate.length === 0) continue;
+
+    candidate.sort((a, b) => b.score - a.score);
+
+    const picked = candidate.slice(0, 7);
+    const digestText = await sonarRegionalMessage(env, {
+      session,
+      items: picked,
+      mode: "digest"
+    });
+
+    await sendTelegram(env, prefs.chatId, digestText, mainMenuKeyboard(prefs));
+
+    prefs.lastSentTs.digest = now;
+    await setUserPrefs(env, uid, prefs);
+
+    for (const p of picked) sentUrls.add(p.url);
+  }
+
+  // 6) Mark sent URLs as seen for 72h
+  for (const url of sentUrls) {
+    const key = KV_PREFIX_SEEN + stableHash(url);
+    await env.NEWS_KV.put(key, "1", { expirationTtl: SEEN_TTL_SECONDS });
+  }
+}
+
+/* =========================================================
+   WEEKLY (forced for all)
+========================================================= */
+
+async function runWeekly(env) {
+  const session = getNySessionInfo(Date.now());
+
+  const weeklyQueries = [
+    "This week major US macro events CPI PCE NFP FOMC Fed speeches market moving",
+    "This week Europe UK Asia macro events ECB BOE BOJ inflation PMI market moving",
+    "This week equities indices S&P 500 Nasdaq DAX FTSE Nikkei key drivers earnings guidance",
+    "This week FX EUR GBP JPY key drivers crosses EURUSD GBPUSD USDJPY",
+    "This week metals gold silver key drivers real yields geopolitics",
+    "This week crypto Bitcoin Ethereum ETFs SEC regulation hacks exploits major headlines"
+  ];
+
+  const raw = [];
+  for (const q of weeklyQueries) {
+    const results = await perplexitySearch(env, q, 8, { recency: "week", country: "US" });
+    for (const r of results) {
+      const it = normalizeResult(r, "WEEK");
+      if (it?.url) raw.push(it);
+    }
+  }
+
+  if (raw.length === 0) return;
+
+  // score and sort
+  const scored = raw.map(x => {
+    const s = scoreSource(x.url) + scoreKeywords(`${x.title} ${x.snippet || ""}`);
+    return { ...x, score: s, impact: impactLabel(s) };
+  }).sort((a,b)=>b.score-a.score);
+
+  const picked = scored.slice(0, 10);
+
+  const weeklyText = await sonarWeekly(env, { session, items: picked });
+
+  await env.NEWS_KV.put(KV_WEEKLY_TEXT, weeklyText, { expirationTtl: SEEN_TTL_SECONDS });
+
+  const userIds = await getUserIndex(env);
+  for (const uid of userIds) {
+    const prefs = await getUserPrefs(env, uid);
+    if (!prefs?.chatId) continue;
+    await sendTelegram(env, prefs.chatId, weeklyText, mainMenuKeyboard(normalizePrefs(prefs)));
+  }
+}
+
+/* =========================================================
+   TELEGRAM BOT UI
+========================================================= */
+
+async function handleTelegramUpdate(env, update) {
+  const msg = update.message;
+  const cb  = update.callback_query;
+
+  if (msg?.text) {
+    const chatId = msg.chat.id;
+    const userId = String(msg.from.id);
+    const text = msg.text.trim();
+
+    let prefs = await getUserPrefs(env, userId);
+    if (!prefs) prefs = structuredClone(DEFAULT_PREFS);
+    prefs.chatId = chatId;
+    prefs = normalizePrefs(prefs);
+
+    await setUserPrefs(env, userId, prefs);
+    await ensureUserInIndex(env, userId);
+
+    if (text === "/start" || text.startsWith("/start")) {
+      await sendTelegram(env, chatId, menuText(), mainMenuKeyboard(prefs));
+      return;
+    }
+
+    if (text === "/weekly") {
+      const weekly = (await env.NEWS_KV.get(KV_WEEKLY_TEXT)) || "Weekly ещё не сформирован.";
+      await sendTelegram(env, chatId, weekly, mainMenuKeyboard(prefs));
+      return;
+    }
+  }
+
+  if (cb?.data) {
+    const userId = String(cb.from.id);
+    let prefs = await getUserPrefs(env, userId);
+    if (!prefs) prefs = structuredClone(DEFAULT_PREFS);
+    prefs = normalizePrefs(prefs);
+
+    const data = cb.data;
+
+    if (data === "MENU") {
+      await editOrSend(env, cb, menuText(), mainMenuKeyboard(prefs));
+      await answerCallback(env, cb.id);
+      await setUserPrefs(env, userId, prefs);
+      return;
+    }
+
+    if (data === "G_REGIONS") {
+      await editOrSend(env, cb, regionsText(prefs), regionsKeyboard(prefs));
+      await answerCallback(env, cb.id);
+      await setUserPrefs(env, userId, prefs);
+      return;
+    }
+
+    if (data === "G_CRYPTO") {
+      await editOrSend(env, cb, cryptoText(prefs), cryptoKeyboard(prefs));
+      await answerCallback(env, cb.id);
+      await setUserPrefs(env, userId, prefs);
+      return;
+    }
+
+    if (data === "G_ETF") {
+      await editOrSend(env, cb, etfText(prefs), etfKeyboard(prefs));
+      await answerCallback(env, cb.id);
+      await setUserPrefs(env, userId, prefs);
+      return;
+    }
+
+    if (data === "SHOW_WEEKLY") {
+      const weekly = (await env.NEWS_KV.get(KV_WEEKLY_TEXT)) || "Weekly ещё не сформирован.";
+      await sendTelegram(env, prefs.chatId, weekly, mainMenuKeyboard(prefs));
+      await answerCallback(env, cb.id);
+      return;
+    }
+
+    // region toggles
+    if (data.startsWith("R_T_")) {
+      const key = data.slice(4); // AMERICAS/EUROPE/UK/ASIA
+      if (prefs.regions?.[key] !== undefined) prefs.regions[key] = !prefs.regions[key];
+      await editOrSend(env, cb, regionsText(prefs), regionsKeyboard(prefs));
+      await answerCallback(env, cb.id);
+      await setUserPrefs(env, userId, prefs);
+      return;
+    }
+
+    // crypto toggles
+    if (data.startsWith("C_T_")) {
+      const key = data.slice(4); // BTC/ETH/...
+      if (prefs.crypto?.[key] !== undefined) prefs.crypto[key] = !prefs.crypto[key];
+      await editOrSend(env, cb, cryptoText(prefs), cryptoKeyboard(prefs));
+      await answerCallback(env, cb.id);
+      await setUserPrefs(env, userId, prefs);
+      return;
+    }
+
+    // etf toggles
+    if (data.startsWith("E_T_")) {
+      const key = data.slice(4); // BTCETF/ETHETF
+      if (prefs.etf?.[key] !== undefined) prefs.etf[key] = !prefs.etf[key];
+      await editOrSend(env, cb, etfText(prefs), etfKeyboard(prefs));
+      await answerCallback(env, cb.id);
+      await setUserPrefs(env, userId, prefs);
+      return;
+    }
+
+    await answerCallback(env, cb.id);
+  }
+}
+
+function menuText() {
+  return [
+    "🧠 Tom’s News Bot",
+    "",
+    "Структура: 🌎 Регионы + 🪙 Крипта + 🧾 ETF",
+    "",
+    "⏱ Тайминг:",
+    "• Вне NY: дайджест раз в 4ч",
+    "• NY-сессия: дайджест раз в 30мин (если есть новости)",
+    "• 🚨 HIGH impact — всегда сразу",
+    "• 🗓 Weekly — всем по умолчанию (вс)"
+  ].join("\n");
+}
+
+function mainMenuKeyboard(prefs) {
+  return {
+    inline_keyboard: [
+      [{ text: "🌎 Регионы", callback_data: "G_REGIONS" }],
+      [{ text: "🪙 Крипта", callback_data: "G_CRYPTO" }],
+      [{ text: "🧾 ETF", callback_data: "G_ETF" }],
+      [{ text: "🗓 Weekly", callback_data: "SHOW_WEEKLY" }]
+    ]
+  };
+}
+
+function regionsText(prefs) {
+  const r = prefs.regions;
+  return [
+    "🌎 Регионы (выбери подписки):",
+    `${r.AMERICAS ? "✅" : "❌"} Americas (USD, SPX/NDX)`,
+    `${r.EUROPE ? "✅" : "❌"} Europe (EUR, GER40)`,
+    `${r.UK ? "✅" : "❌"} UK (GBP, UKX)`,
+    `${r.ASIA ? "✅" : "❌"} Asia (JPY, JP225)`,
+    "",
+    "🚨 HIGH impact по выбранным регионам приходит сразу."
+  ].join("\n");
+}
+
+function regionsKeyboard(prefs) {
+  const r = prefs.regions;
+  return {
+    inline_keyboard: [
+      [{ text: `${r.AMERICAS ? "✅" : "❌"} Americas`, callback_data: "R_T_AMERICAS" }],
+      [{ text: `${r.EUROPE ? "✅" : "❌"} Europe`, callback_data: "R_T_EUROPE" }],
+      [{ text: `${r.UK ? "✅" : "❌"} UK`, callback_data: "R_T_UK" }],
+      [{ text: `${r.ASIA ? "✅" : "❌"} Asia`, callback_data: "R_T_ASIA" }],
+      [{ text: "⬅️ Меню", callback_data: "MENU" }]
+    ]
+  };
+}
+
+function cryptoText(prefs) {
+  const c = prefs.crypto;
+  return [
+    "🪙 Крипта (выбери подписки):",
+    `${c.BTC ? "✅" : "❌"} BTC`,
+    `${c.ETH ? "✅" : "❌"} ETH`,
+    `${c.XRP ? "✅" : "❌"} XRP`,
+    `${c.SOL ? "✅" : "❌"} SOL`,
+    `${c.BNB ? "✅" : "❌"} BNB`,
+    `${c.USDT ? "✅" : "❌"} USDT`,
+    `${c.ALTS ? "✅" : "❌"} Altcoins (HIGH only)`
+  ].join("\n");
+}
+
+function cryptoKeyboard(prefs) {
+  const c = prefs.crypto;
+  return {
+    inline_keyboard: [
+      [{ text: `${c.BTC ? "✅" : "❌"} BTC`, callback_data: "C_T_BTC" }],
+      [{ text: `${c.ETH ? "✅" : "❌"} ETH`, callback_data: "C_T_ETH" }],
+      [{ text: `${c.XRP ? "✅" : "❌"} XRP`, callback_data: "C_T_XRP" }],
+      [{ text: `${c.SOL ? "✅" : "❌"} SOL`, callback_data: "C_T_SOL" }],
+      [{ text: `${c.BNB ? "✅" : "❌"} BNB`, callback_data: "C_T_BNB" }],
+      [{ text: `${c.USDT ? "✅" : "❌"} USDT`, callback_data: "C_T_USDT" }],
+      [{ text: `${c.ALTS ? "✅" : "❌"} Altcoins(HIGH)`, callback_data: "C_T_ALTS" }],
+      [{ text: "⬅️ Меню", callback_data: "MENU" }]
+    ]
+  };
+}
+
+function etfText(prefs) {
+  const e = prefs.etf;
+  return [
+    "🧾 ETF (выбери подписки):",
+    `${e.BTCETF ? "✅" : "❌"} BTC ETF`,
+    `${e.ETHETF ? "✅" : "❌"} ETH ETF`
+  ].join("\n");
+}
+
+function etfKeyboard(prefs) {
+  const e = prefs.etf;
+  return {
+    inline_keyboard: [
+      [{ text: `${e.BTCETF ? "✅" : "❌"} BTC ETF`, callback_data: "E_T_BTCETF" }],
+      [{ text: `${e.ETHETF ? "✅" : "❌"} ETH ETF`, callback_data: "E_T_ETHETF" }],
+      [{ text: "⬅️ Меню", callback_data: "MENU" }]
+    ]
+  };
+}
+
+/* =========================================================
+   SONAR OUTPUT (regional structure + instruments mapping)
+========================================================= */
+
+async function sonarRegionalMessage(env, { session, items, mode }) {
+  const list = items.map((x, i) =>
+    `${i + 1}. (${x.impact}) [${x.tag}] ${x.title}\nURL: ${x.url}\nSnippet: ${x.snippet || ""}`
+  ).join("\n\n");
+
+  const system = [
+    "You are a market news editor for a trading Telegram bot.",
+    "Write in Russian, compact, structured, no fluff.",
+    "We structure primarily by REGION (Americas/Europe/UK/Asia), plus ETF and Crypto blocks if present.",
+    "Each bullet must include:",
+    "• Impact (HIGH/MED/LOW)",
+    "• TL;DR effect (risk-on/off, USD strength/weakness, yields up/down, etc.)",
+    "• Affected instruments: indices (SPX/NDX/GER40/UKX/JP225) and/or FX crosses (EURUSD, GBPUSD, USDJPY, EURGBP), metals (XAU/XAG), crypto tickers and ETF if relevant",
+    "• 1–2 source links",
+    "End with a short '🎯 Impact Map' (Indices / FX crosses / Metals / Crypto+ETF).",
+    "Output must be Telegram-friendly plain text."
+  ].join(" ");
+
+  const isHigh = mode === "high_alert";
+  const title = isHigh ? "🚨 HIGH IMPACT ALERT" : "📰 NEWS DIGEST";
+
+  const user = [
+    `${title}`,
+    `NY time: ${session.nyStamp}. In-session=${session.inSession}.`,
+    "",
+    "INPUT ITEMS:",
+    list,
+    "",
+    "OUTPUT FORMAT:",
+    "━━━━━━━━━━━━━━━━━━",
+    "🧠 TL;DR:",
+    "• 1–2 строки, как влияет",
+    "",
+    isHigh ? "🚨 BREAKING:" : "🧩 Updates (3–7):",
+    "1) (IMPACT) [REGION/ETF/CRYPTO] what happened — effect — affected instruments — link",
+    "2) ...",
+    "",
+    "🎯 Impact Map:",
+    "• Indices: ...",
+    "• FX crosses: ...",
+    "• Metals: ...",
+    "• Crypto/ETF: ..."
+  ].join("\n");
+
+  return await sonarCall(env, system, user, SONAR_SEARCH_CONTEXT_SIZE);
+}
+
+async function sonarWeekly(env, { session, items }) {
+  const list = items.map((x, i) =>
+    `${i + 1}. ${x.title}\nURL: ${x.url}\nSnippet: ${x.snippet || ""}`
+  ).join("\n\n");
+
+  const system = [
+    "You are a market weekly editor for a trading Telegram bot.",
+    "Write in Russian, structured, compact.",
+    "Group by: Americas / Europe / UK / Asia / ETF / Crypto.",
+    "Each bullet: what happened + why it matters + affected indices/crosses + 1 link.",
+  ].join(" ");
+
+  const user = [
+    "🗓 WEEKLY DIGEST",
+    `NY time: ${session.nyStamp}.`,
+    "",
+    "INPUT LINKS:",
+    list
+  ].join("\n");
+
+  return await sonarCall(env, system, user, "medium");
+}
+
+async function sonarCall(env, system, user, contextSize) {
+  const body = {
+    model: SONAR_MODEL,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user }
+    ],
+    web_search_options: {
+      search_context_size: contextSize,
+      search_type: SONAR_SEARCH_TYPE
+    }
+  };
+
+  const res = await fetch(PERPLEXITY_CHAT_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.PERPLEXITY_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) throw new Error(`Perplexity Chat error ${res.status}: ${await res.text()}`);
+  const json = await res.json();
+  const content = json?.choices?.[0]?.message?.content || "";
+  return `${content}\n\n⏱ NY: ${getNySessionInfo(Date.now()).nyStamp}`;
+}
+
+/* =========================================================
+   PERPLEXITY SEARCH
+========================================================= */
+
+async function perplexitySearch(env, query, maxResults, opts = {}) {
+  const body = {
+    query,
+    max_results: maxResults,
+    max_tokens_per_page: 900,
+    max_tokens: 12000,
+    country: opts.country || "US",
+    search_language_filter: ["en"]
+  };
+  if (opts.recency) body.search_recency_filter = opts.recency;
+
+  const res = await fetch(PERPLEXITY_SEARCH_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.PERPLEXITY_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) throw new Error(`Perplexity Search error ${res.status}: ${await res.text()}`);
+  const json = await res.json();
+  return json.results || [];
+}
+
+/* =========================================================
+   ROUTING: what user wants
+========================================================= */
+
+function userWantsTag(prefs, tag) {
+  // Regions
+  if (tag === "REG_AMERICAS") return !!prefs.regions?.AMERICAS;
+  if (tag === "REG_EUROPE")   return !!prefs.regions?.EUROPE;
+  if (tag === "REG_UK")       return !!prefs.regions?.UK;
+  if (tag === "REG_ASIA")     return !!prefs.regions?.ASIA;
+
+  // Crypto
+  if (tag === "CR_BTC")  return !!prefs.crypto?.BTC;
+  if (tag === "CR_ETH")  return !!prefs.crypto?.ETH;
+  if (tag === "CR_XRP")  return !!prefs.crypto?.XRP;
+  if (tag === "CR_SOL")  return !!prefs.crypto?.SOL;
+  if (tag === "CR_BNB")  return !!prefs.crypto?.BNB;
+  if (tag === "CR_USDT") return !!prefs.crypto?.USDT;
+  if (tag === "CR_ALTS") return !!prefs.crypto?.ALTS;
+
+  // ETF
+  if (tag === "ETF_BTCETF") return !!prefs.etf?.BTCETF;
+  if (tag === "ETF_ETFETF") return !!prefs.etf?.ETHETF; // (not used)
+  if (tag === "ETF_ETHETF") return !!prefs.etf?.ETHETF;
+
+  return false;
+}
+
+function collectUserItems(prefs, byTag) {
+  const tags = [];
+
+  // Regions
+  if (prefs.regions?.AMERICAS) tags.push("REG_AMERICAS");
+  if (prefs.regions?.EUROPE)   tags.push("REG_EUROPE");
+  if (prefs.regions?.UK)       tags.push("REG_UK");
+  if (prefs.regions?.ASIA)     tags.push("REG_ASIA");
+
+  // Crypto
+  if (prefs.crypto?.BTC)  tags.push("CR_BTC");
+  if (prefs.crypto?.ETH)  tags.push("CR_ETH");
+  if (prefs.crypto?.XRP)  tags.push("CR_XRP");
+  if (prefs.crypto?.SOL)  tags.push("CR_SOL");
+  if (prefs.crypto?.BNB)  tags.push("CR_BNB");
+  if (prefs.crypto?.USDT) tags.push("CR_USDT");
+  if (prefs.crypto?.ALTS) tags.push("CR_ALTS");
+
+  // ETF
+  if (prefs.etf?.BTCETF) tags.push("ETF_BTCETF");
+  if (prefs.etf?.ETHETF) tags.push("ETF_ETHETF");
+
+  const out = [];
+  const seen = new Set();
+
+  for (const t of tags) {
+    const arr = byTag.get(t) || [];
+    // take top few per tag to balance
+    for (const it of arr.slice(0, 4)) {
+      if (seen.has(it.url)) continue;
+      seen.add(it.url);
+      out.push(it);
+    }
+  }
+
+  return out;
+}
+
+/* =========================================================
+   TELEGRAM SEND / EDIT
+========================================================= */
+
+async function sendTelegram(env, chatId, text, replyMarkup = null) {
+  const url = `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`;
+  const safe = text.length > 3800 ? (text.slice(0, 3800) + "…") : text;
+
+  const payload = {
+    chat_id: chatId,
+    text: safe,
+    disable_web_page_preview: false
+  };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  if (!res.ok) throw new Error(`Telegram sendMessage error ${res.status}: ${await res.text()}`);
+}
+
+async function editOrSend(env, cb, text, replyMarkup) {
+  const msg = cb.message;
+  if (!msg) {
+    await sendTelegram(env, cb.from.id, text, replyMarkup);
+    return;
+  }
+
+  const url = `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/editMessageText`;
+  const payload = {
+    chat_id: msg.chat.id,
+    message_id: msg.message_id,
+    text,
+    disable_web_page_preview: false,
+    reply_markup: replyMarkup
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  if (!res.ok) {
+    // fallback
+    await sendTelegram(env, msg.chat.id, text, replyMarkup);
+  }
+}
+
+async function answerCallback(env, callbackQueryId) {
+  const url = `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/answerCallbackQuery`;
+  await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackQueryId })
+  }).catch(() => {});
+}
+
+/* =========================================================
+   USERS KV
+========================================================= */
+
+async function getUserPrefs(env, userId) {
+  const raw = await env.USERS_KV.get(USER_PREFIX + userId);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+async function setUserPrefs(env, userId, prefs) {
+  await env.USERS_KV.put(USER_PREFIX + userId, JSON.stringify(prefs));
+}
+
+async function getUserIndex(env) {
+  const raw = await env.USERS_KV.get(USER_INDEX);
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+async function ensureUserInIndex(env, userId) {
+  const idx = await getUserIndex(env);
+  if (!idx.includes(userId)) {
+    idx.push(userId);
+    await env.USERS_KV.put(USER_INDEX, JSON.stringify(idx));
+  }
+}
+
+function normalizePrefs(prefs) {
+  const p = { ...structuredClone(DEFAULT_PREFS), ...prefs };
+  p.regions = { ...structuredClone(DEFAULT_PREFS.regions), ...(prefs.regions || {}) };
+  p.crypto  = { ...structuredClone(DEFAULT_PREFS.crypto),  ...(prefs.crypto || {}) };
+  p.etf     = { ...structuredClone(DEFAULT_PREFS.etf),     ...(prefs.etf || {}) };
+  p.lastSentTs = { ...structuredClone(DEFAULT_PREFS.lastSentTs), ...(prefs.lastSentTs || {}) };
+  return p;
+}
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function normalizeResult(r, tag) {
+  return {
+    tag,
+    title: r.title || "",
+    url: r.url || "",
+    snippet: (r.snippet || "").slice(0, 500),
+    date: r.date || null
+  };
+}
+
+function getNySessionInfo(ts) {
+  const d = new Date(ts);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    weekday: "short",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(d);
+
+  const get = (type) => parts.find(p => p.type === type)?.value;
+  const weekday = get("weekday");
+  const hour = Number(get("hour"));
+  const minute = Number(get("minute"));
+
+  const isWeekday = ["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday);
+  const minutesOfDay = hour * 60 + minute;
+  const open = 9 * 60 + 30;
+  const close = 16 * 60;
+  const inSession = isWeekday && minutesOfDay >= open && minutesOfDay <= close;
+
+  const nyStamp = `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")} NY`;
+  return { inSession, nyStamp };
+}
+
+function stableHash(str) {
+  // FNV-1a 32-bit
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
+}
