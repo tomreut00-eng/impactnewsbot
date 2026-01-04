@@ -1,0 +1,484 @@
+/**
+ * Telegram Macro Analyzer Bot — Cloudflare Worker (service-worker syntax)
+ *
+ * ✅ Fixed assets only (no manual ticker)
+ * ✅ No menus, no inline buttons
+ * ✅ Bottom Reply Keyboard with assets (always visible)
+ * ✅ Always: 3–5 days, Trader, Extended
+ * ✅ Macro-context: only 2–3 theses
+ * ✅ Anti-truncation: END marker + fallback continuation call (NO stop param)
+ * ✅ KV rate-limit
+ * ✅ Plain text only (no parse_mode)
+ *
+ * REQUIRED BINDINGS:
+ *   KV Namespace binding: BOT_KV
+ *
+ * REQUIRED SECRETS:
+ *   TELEGRAM_BOT_TOKEN
+ *   PERPLEXITY_API_KEY
+ *
+ * OPTIONAL:
+ *   PERPLEXITY_MODEL        (default: "sonar-pro")
+ *   REQUEST_TIMEOUT         (ms, default: 25000)
+ *   RATE_LIMIT_SECONDS      (default: 20)   // KV TTL >= 60 is enforced
+ *   TELEGRAM_WEBHOOK_SECRET (optional)
+ */
+
+addEventListener("fetch", (event) => {
+  event.respondWith(handleFetch(event.request, event));
+});
+
+const PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions";
+const PARSE_MODE = undefined; // plain text only
+
+const ASSETS = [
+  { label: "SP500", ticker: "^GSPC", style: "INDEX" },
+  { label: "NASDAQ", ticker: "^NDX", style: "INDEX" },
+  { label: "UKX", ticker: "^FTSE", style: "INDEX" },
+  { label: "DAX", ticker: "^GDAXI", style: "INDEX" },
+  { label: "EUR", ticker: "EURUSD", style: "FX" },
+  { label: "GBP", ticker: "GBPUSD", style: "FX" },
+  { label: "TLT", ticker: "TLT", style: "INDEX" },
+  { label: "VIX", ticker: "^VIX", style: "INDEX" },
+  { label: "GOLD", ticker: "XAUUSD", style: "INDEX" },
+  { label: "SILVER", ticker: "XAGUSD", style: "INDEX" }
+];
+
+const ASSET_MAP = (() => {
+  const m = Object.create(null);
+  for (const a of ASSETS) m[a.label.toLowerCase()] = a;
+  return m;
+})();
+
+function assetsReplyKeyboard() {
+  return {
+    keyboard: [
+      [{ text: "SP500" }, { text: "NASDAQ" }],
+      [{ text: "UKX" }, { text: "DAX" }],
+      [{ text: "EUR" }, { text: "GBP" }],
+      [{ text: "TLT" }, { text: "VIX" }],
+      [{ text: "GOLD" }, { text: "SILVER" }]
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+    one_time_keyboard: false
+  };
+}
+
+/* =========================
+   Fetch / webhook
+========================= */
+async function handleFetch(req, event) {
+  if (req.method === "GET") {
+    const url = new URL(req.url);
+    if (url.pathname === "/health") return new Response("OK", { status: 200 });
+    return new Response("OK", { status: 200 });
+  }
+
+  if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+
+  const secret = (globalThis.TELEGRAM_WEBHOOK_SECRET || "").trim();
+  if (secret) {
+    const hdr = req.headers.get("X-Telegram-Bot-Api-Secret-Token");
+    if (hdr !== secret) return new Response("Forbidden", { status: 403 });
+  }
+
+  let update;
+  try {
+    update = await req.json();
+  } catch {
+    return new Response("Bad Request", { status: 400 });
+  }
+
+  event.waitUntil(handleUpdate(update));
+  return new Response("OK", { status: 200 });
+}
+
+async function handleUpdate(update) {
+  try {
+    if (update.message) return await onMessage(update.message);
+  } catch (e) {
+    const chatId = update && update.message && update.message.chat && update.message.chat.id;
+    if (chatId) {
+      await tgSendMessage(
+        chatId,
+        `⚠️ Ошибка: ${String(e && e.message ? e.message : e)}`,
+        PARSE_MODE,
+        assetsReplyKeyboard()
+      );
+    }
+  }
+}
+
+/* =========================
+   Telegram messages
+========================= */
+async function onMessage(msg) {
+  const chatId = msg.chat.id;
+  const userId = msg.from && msg.from.id;
+  const textRaw = (msg.text || "").trim();
+  const text = textRaw.toLowerCase();
+
+  if (!userId) return;
+
+  // /start and /analyze just show keyboard, no extra texts
+  if (text === "/start" || text === "/analyze" || text === "/analyse") {
+    await touchUser(userId);
+    return tgSendMessage(chatId, " ", PARSE_MODE, assetsReplyKeyboard());
+  }
+
+  // pressed asset button
+  const asset = ASSET_MAP[text];
+  if (asset) {
+    if (!(await checkRateLimit(userId))) {
+      return tgSendMessage(chatId, "Слишком часто. Подожди немного.", PARSE_MODE, assetsReplyKeyboard());
+    }
+
+    const out = await runMacroAnalysis(asset);
+    return tgSendLongMessage(chatId, out);
+  }
+
+  return tgSendMessage(chatId, "Выбери актив кнопкой снизу.", PARSE_MODE, assetsReplyKeyboard());
+}
+
+/* =========================
+   KV: touch + rate limit
+========================= */
+function userKey(userId) { return "u:" + userId + ":touch"; }
+function rlKey(userId) { return "u:" + userId + ":rl"; }
+
+async function touchUser(userId) {
+  await BOT_KV.put(userKey(userId), String(Date.now()), { expirationTtl: 60 * 60 * 24 * 7 });
+}
+
+async function checkRateLimit(userId) {
+  const n = parseInt(globalThis.RATE_LIMIT_SECONDS || "20", 10);
+  const now = Date.now();
+
+  const raw = await BOT_KV.get(rlKey(userId));
+  if (raw) {
+    const last = parseInt(raw, 10);
+    if (!Number.isNaN(last) && now - last < n * 1000) return false;
+  }
+
+  const ttl = Math.max(60, n + 30);
+  await BOT_KV.put(rlKey(userId), String(now), { expirationTtl: ttl });
+  return true;
+}
+
+/* =========================
+   Perplexity (anti-truncation WITHOUT stop)
+========================= */
+async function runMacroAnalysis(asset) {
+  const timeoutMs = parseInt(globalThis.REQUEST_TIMEOUT || "25000", 10);
+  const model = String(globalThis.PERPLEXITY_MODEL || "sonar-pro").trim();
+
+  const horizon = "3–5 дней";
+  const prompt = buildPrompt(asset.label, asset.ticker, horizon, asset.style);
+
+  const controller = new AbortController();
+  const to = setTimeout(() => controller.abort("timeout"), timeoutMs);
+
+  try {
+    // 1) Primary response (bigger to avoid truncation)
+    let text = await perplexityAsk({
+      model,
+      prompt,
+      signal: controller.signal,
+      maxTokens: 900
+    });
+
+    // 2) If END missing -> continuation (cheap)
+    if (!hasEndMarker(text)) {
+      const cont = await perplexityContinue({
+        model,
+        originalPrompt: prompt,
+        partialAnswer: text,
+        signal: controller.signal,
+        maxTokens: 320
+      });
+      text = mergeContinuation(text, cont);
+    }
+
+    // Cleanup + remove END
+    let out = normalizeForTelegram(text);
+    out = removeEndMarker(out);
+    out = ruCleanup(out);
+    out = stripFormattingArtifacts(out);
+
+    if (!out) return "Пустой ответ. Попробуй ещё раз.";
+    return out;
+  } catch (e) {
+    const msg = String(e && e.message ? e.message : e);
+    if (msg.indexOf("timeout") >= 0 || msg.indexOf("Abort") >= 0) {
+      return "Таймаут Perplexity. Попробуй позже.";
+    }
+    return "Ошибка Perplexity: " + msg;
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+function hasEndMarker(s) {
+  const t = String(s || "").trimEnd();
+  return t.endsWith("\nEND") || t.endsWith("END");
+}
+
+function removeEndMarker(s) {
+  let t = String(s || "");
+  // remove trailing END line if present
+  t = t.replace(/\nEND\s*$/g, "");
+  t = t.replace(/^END\s*$/g, "");
+  return t.trim();
+}
+
+function mergeContinuation(first, second) {
+  const a = String(first || "").trimEnd();
+  let b = String(second || "").trim();
+  if (!b) return a;
+
+  // If continuation starts with duplicated headers, try to avoid repeating too much
+  // but keep it simple: just append.
+  return a + "\n" + b;
+}
+
+async function perplexityAsk(opts) {
+  const apiKey = globalThis.PERPLEXITY_API_KEY;
+  if (!apiKey) throw new Error("PERPLEXITY_API_KEY is not set");
+
+  const body = {
+    model: opts.model,
+    messages: [
+      {
+        role: "system",
+        content:
+          "Ты макро-стратег. Пиши кратко, по делу, на русском. " +
+          "Без таблиц/ссылок/источников. Без англицизмов. Без форматирования. " +
+          "ВСЕГДА заканчивай ответ отдельной строкой: END."
+      },
+      { role: "user", content: opts.prompt }
+    ],
+    temperature: 0.2,
+    top_p: 0.9,
+    max_tokens: opts.maxTokens || 900,
+    // дешевле и стабильнее: маленький контекст поиска
+    search_context_size: "low"
+  };
+
+  const res = await fetch(PERPLEXITY_URL, {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + apiKey,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body),
+    signal: opts.signal
+  });
+
+  if (!res.ok) {
+    const txt = await safeText(res);
+    throw new Error("HTTP " + res.status + ": " + (txt || res.statusText));
+  }
+
+  const data = await res.json().catch(() => ({}));
+  const content =
+    (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) ||
+    data.output_text ||
+    "";
+
+  return String(content || "").trim();
+}
+
+async function perplexityContinue(opts) {
+  const apiKey = globalThis.PERPLEXITY_API_KEY;
+  if (!apiKey) throw new Error("PERPLEXITY_API_KEY is not set");
+
+  const body = {
+    model: opts.model,
+    messages: [
+      {
+        role: "system",
+        content:
+          "Ты макро-стратег. Продолжай строго с места обрыва. " +
+          "Не повторяй уже написанное. Не добавляй новые разделы. " +
+          "Доведи до конца все недостающие пункты. " +
+          "Пиши на русском, без форматирования. " +
+          "ВСЕГДА заканчивай отдельной строкой: END."
+      },
+      {
+        role: "user",
+        content:
+          "Исходные инструкции:\n" +
+          opts.originalPrompt +
+          "\n\nОТРЫВОК ОТВЕТА (обрезан):\n" +
+          opts.partialAnswer +
+          "\n\nПродолжи с места обрыва и заверши. В конце отдельная строка END."
+      }
+    ],
+    temperature: 0.2,
+    top_p: 0.9,
+    max_tokens: opts.maxTokens || 320,
+    search_context_size: "low"
+  };
+
+  const res = await fetch(PERPLEXITY_URL, {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + apiKey,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body),
+    signal: opts.signal
+  });
+
+  if (!res.ok) {
+    const txt = await safeText(res);
+    throw new Error("HTTP " + res.status + ": " + (txt || res.statusText));
+  }
+
+  const data = await res.json().catch(() => ({}));
+  const content =
+    (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) ||
+    data.output_text ||
+    "";
+
+  return String(content || "").trim();
+}
+
+function buildPrompt(assetLabel, ticker, horizon, style) {
+  const styleRule =
+    style === "FX"
+      ? "FX: дифференциал ставок/доходностей, доллар США, аппетит к риску."
+      : "INDEX: реальные ставки/доходности, ожидания по ставкам ФРС, финансовые условия, доллар.";
+
+  return [
+    "Пиши СТРОГО на хорошем русском языке, обычным текстом.",
+    "Любое форматирование запрещено: никаких **, __, *, `.",
+    "Запрещены английские слова/аббревиатуры.",
+    "Без таблиц, ссылок, источников, уровней.",
+    "",
+    "Режим: Trader. Максимум практики, минимум воды.",
+    "Не раздувай текст: каждый пункт 1 строка.",
+    "",
+    styleRule,
+    `Актив: ${assetLabel} (${ticker})`,
+    `Горизонт: ${horizon}`,
+    "",
+    "СТРУКТУРА (строго):",
+    "🔥 КЛЮЧЕВЫЕ СОБЫТИЯ",
+    "• РОВНО 2–3 пункта, 1 строка каждый",
+    "",
+    "📊 МАКРО-КОНТЕКСТ",
+    "• РОВНО 2–3 тезиса, 1 строка каждый",
+    "",
+    "🎯 СЦЕНАРИИ",
+    "Base: 1 строка (условие → реакция → причина)",
+    "Bull: 1 строка",
+    "Bear: 1 строка",
+    "",
+    "⚠️ РИСКИ",
+    "• РОВНО 3–4 пункта, 1 строка каждый",
+    "",
+    "🧠 TL;DR",
+    "• РОВНО 2–3 пункта, 1 строка каждый",
+    "",
+    "В конце ОБЯЗАТЕЛЬНО отдельная строка: END"
+  ].join("\n");
+}
+
+/* =========================
+   Output cleanup
+========================= */
+function ruCleanup(text) {
+  const pairs = [
+    [/payrolls/gi, "занятость в США"],
+    [/\bcut\b/gi, "снижение ставки"],
+    [/earnings/gi, "отчётность компаний"],
+    [/guidance/gi, "прогноз менеджмента"],
+    [/risk[-\s]?on/gi, "аппетит к риску"],
+    [/risk[-\s]?off/gi, "уход от риска"],
+    [/hawkish/gi, "жёсткий тон"],
+    [/dovish/gi, "мягкий тон"],
+    [/minutes/gi, "протокол заседания"],
+    [/\byoy\b/gi, "г/г"],
+    [/\bbp\b/gi, "б.п."]
+  ];
+
+  let out = String(text || "");
+  for (let i = 0; i < pairs.length; i++) out = out.replace(pairs[i][0], pairs[i][1]);
+  return out;
+}
+
+function stripFormattingArtifacts(text) {
+  let out = String(text || "");
+  out = out.split("**").join("");
+  out = out.split("__").join("");
+  out = out.split("*").join("");
+  out = out.split("`").join("");
+  return out;
+}
+
+function normalizeForTelegram(s) {
+  return String(s || "").replace(/\r\n/g, "\n").replace(/\u0000/g, "").trim();
+}
+
+/* =========================
+   Telegram API
+========================= */
+async function tgApi(method, body) {
+  const token = globalThis.TELEGRAM_BOT_TOKEN;
+  if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not set");
+
+  const url = "https://api.telegram.org/bot" + token + "/" + method;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    const t = await safeText(res);
+    throw new Error("Telegram " + method + " failed: " + res.status + " " + t);
+  }
+  return res.json().catch(() => ({}));
+}
+
+async function tgSendMessage(chatId, text, parseMode, replyMarkup) {
+  return tgApi("sendMessage", {
+    chat_id: chatId,
+    text: text,
+    parse_mode: parseMode,
+    disable_web_page_preview: true,
+    reply_markup: replyMarkup
+  });
+}
+
+async function tgSendLongMessage(chatId, text) {
+  const chunks = splitTelegram(text, 3500);
+  for (let i = 0; i < chunks.length; i++) {
+    await tgSendMessage(chatId, chunks[i], PARSE_MODE, assetsReplyKeyboard());
+  }
+}
+
+function splitTelegram(text, maxLen) {
+  const out = [];
+  let t = String(text || "");
+
+  while (t.length > maxLen) {
+    let cut = t.lastIndexOf("\n", maxLen);
+    if (cut < 1200) cut = maxLen;
+    out.push(t.slice(0, cut));
+    t = t.slice(cut);
+  }
+  if (t.trim().length) out.push(t);
+  return out;
+}
+
+async function safeText(res) {
+  try {
+    return (await res.text()).slice(0, 800);
+  } catch {
+    return "";
+  }
+}
