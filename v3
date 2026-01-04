@@ -1,0 +1,437 @@
+/**
+ * Macro Master (by Tomof) — Cloudflare Worker (service-worker syntax)
+ *
+ * ✅ Fixed assets only (no manual ticker)
+ * ✅ Reply Keyboard toggleable (shows as ⬜⬜ button in Telegram)
+ * ✅ Always: 3–5 days, Trader, Extended
+ * ✅ No tables / no sources block
+ * ✅ Removes Perplexity citations like [1][2]
+ * ✅ Forces clean Telegram structure (headers never glue to previous text)
+ * ✅ Anti-truncation: END marker + continuation call (NO stop param)
+ * ✅ KV rate limit (TTL >= 60)
+ *
+ * REQUIRED BINDINGS:
+ *   KV Namespace binding: BOT_KV
+ *
+ * REQUIRED SECRETS:
+ *   TELEGRAM_BOT_TOKEN
+ *   PERPLEXITY_API_KEY
+ *
+ * OPTIONAL:
+ *   PERPLEXITY_MODEL        (default: "sonar-pro")
+ *   REQUEST_TIMEOUT         (ms, default: 25000)
+ *   RATE_LIMIT_SECONDS      (default: 20)
+ *   TELEGRAM_WEBHOOK_SECRET (optional)
+ */
+
+addEventListener("fetch", (event) => {
+  event.respondWith(handleFetch(event.request, event));
+});
+
+const TG_API = "https://api.telegram.org/bot";
+const PPLX_API = "https://api.perplexity.ai/chat/completions";
+const PARSE_MODE = undefined;
+
+/* =======================
+   Assets
+======================= */
+const ASSETS = [
+  { label: "SP500", ticker: "^GSPC", style: "INDEX" },
+  { label: "NASDAQ", ticker: "^NDX", style: "INDEX" },
+  { label: "UKX", ticker: "^FTSE", style: "INDEX" },
+  { label: "DAX", ticker: "^GDAXI", style: "INDEX" },
+  { label: "EUR", ticker: "EURUSD", style: "FX" },
+  { label: "GBP", ticker: "GBPUSD", style: "FX" },
+  { label: "TLT", ticker: "TLT", style: "INDEX" },
+  { label: "VIX", ticker: "^VIX", style: "INDEX" },
+  { label: "GOLD", ticker: "XAUUSD", style: "INDEX" },
+  { label: "SILVER", ticker: "XAGUSD", style: "INDEX" }
+];
+
+const ASSET_MAP = (() => {
+  const m = Object.create(null);
+  for (const a of ASSETS) m[a.label.toLowerCase()] = a;
+  return m;
+})();
+
+/* =======================
+   Reply Keyboard (toggleable via ⬜⬜)
+======================= */
+function assetsReplyKeyboard() {
+  return {
+    keyboard: [
+      [{ text: "SP500" }, { text: "NASDAQ" }],
+      [{ text: "UKX" }, { text: "DAX" }],
+      [{ text: "EUR" }, { text: "GBP" }],
+      [{ text: "TLT" }, { text: "VIX" }],
+      [{ text: "GOLD" }, { text: "SILVER" }]
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+    input_field_placeholder: "Выбери актив"
+  };
+}
+
+/* =======================
+   Fetch / Webhook
+======================= */
+async function handleFetch(req, event) {
+  if (req.method === "GET") {
+    const url = new URL(req.url);
+    if (url.pathname === "/health") return new Response("OK", { status: 200 });
+    return new Response("OK", { status: 200 });
+  }
+
+  if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+
+  const secret = (globalThis.TELEGRAM_WEBHOOK_SECRET || "").trim();
+  if (secret) {
+    const hdr = req.headers.get("X-Telegram-Bot-Api-Secret-Token");
+    if (hdr !== secret) return new Response("Forbidden", { status: 403 });
+  }
+
+  let update;
+  try {
+    update = await req.json();
+  } catch {
+    return new Response("Bad Request", { status: 400 });
+  }
+
+  event.waitUntil(handleUpdate(update));
+  return new Response("OK", { status: 200 });
+}
+
+/* =======================
+   Update Router
+======================= */
+async function handleUpdate(update) {
+  try {
+    if (!update.message) return;
+    await onMessage(update.message);
+  } catch (e) {
+    const chatId = update?.message?.chat?.id;
+    if (chatId) {
+      await tgSendMessage(chatId, `⚠️ Ошибка: ${String(e?.message || e)}`, assetsReplyKeyboard());
+    }
+  }
+}
+
+/* =======================
+   Message handler
+======================= */
+async function onMessage(msg) {
+  const chatId = msg.chat.id;
+  const userId = msg.from?.id;
+  const textRaw = (msg.text || "").trim();
+  const text = textRaw.toLowerCase();
+
+  if (!userId) return;
+
+  // /start and /analyze just show keyboard, no extra texts
+  if (text === "/start" || text === "/analyze" || text === "/analyse") {
+    return tgSendMessage(chatId, " ", assetsReplyKeyboard());
+  }
+
+  // pressed asset button
+  const asset = ASSET_MAP[text];
+  if (!asset) {
+    return tgSendMessage(chatId, "Выбери актив кнопкой ниже.", assetsReplyKeyboard());
+  }
+
+  if (!(await checkRateLimit(userId))) {
+    return tgSendMessage(chatId, "Слишком часто. Подожди немного.", assetsReplyKeyboard());
+  }
+
+  const report = await runAnalysis(asset);
+  return tgSendLong(chatId, report);
+}
+
+/* =======================
+   Rate limit (KV)
+======================= */
+function rlKey(uid) {
+  return `rl:${uid}`;
+}
+
+async function checkRateLimit(uid) {
+  const limit = parseInt(globalThis.RATE_LIMIT_SECONDS || "20", 10);
+  const now = Date.now();
+
+  const last = await BOT_KV.get(rlKey(uid));
+  if (last && now - Number(last) < limit * 1000) return false;
+
+  await BOT_KV.put(rlKey(uid), String(now), { expirationTtl: Math.max(60, limit + 10) });
+  return true;
+}
+
+/* =======================
+   Perplexity analysis
+======================= */
+async function runAnalysis(asset) {
+  const timeoutMs = parseInt(globalThis.REQUEST_TIMEOUT || "25000", 10);
+  const model = String(globalThis.PERPLEXITY_MODEL || "sonar-pro").trim();
+
+  const controller = new AbortController();
+  const to = setTimeout(() => controller.abort("timeout"), timeoutMs);
+
+  try {
+    const prompt = buildPrompt(asset);
+
+    // Primary answer
+    let text = await askPerplexity({
+      model,
+      prompt,
+      maxTokens: 900,
+      signal: controller.signal
+    });
+
+    // If END missing -> continuation (cheap)
+    if (!hasEndMarker(text)) {
+      const cont = await askPerplexity({
+        model,
+        prompt:
+          "Продолжи строго с места обрыва. Не повторяй уже написанное. " +
+          "Не добавляй новых разделов. Заверши недостающие строки и закончи отдельной строкой END.\n\n" +
+          "ОТРЫВОК (обрезан):\n" +
+          text,
+        maxTokens: 320,
+        signal: controller.signal
+      });
+      text = mergeContinuation(text, cont);
+    }
+
+    // Cleanup + enforce structure
+    let out = text;
+    out = removeEndMarker(out);
+    out = cleanText(out);
+    out = fixStructure(out);
+
+    if (!out) return "Пустой ответ. Попробуй ещё раз.";
+    return out;
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (msg.includes("timeout") || msg.includes("Abort")) return "Таймаут Perplexity. Попробуй позже.";
+    return "Ошибка Perplexity: " + msg;
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+async function askPerplexity({ model, prompt, maxTokens, signal }) {
+  if (!globalThis.PERPLEXITY_API_KEY) throw new Error("PERPLEXITY_API_KEY is not set");
+
+  const body = {
+    model,
+    messages: [
+      {
+        role: "system",
+        content:
+          "Ты макро-стратег. Пиши строго на русском языке. " +
+          "Без таблиц, ссылок, источников и без англицизмов. " +
+          "Без форматирования (**/__/*/`). " +
+          "Каждый заголовок раздела должен быть на новой строке и перед ним пустая строка. " +
+          "В конце всегда отдельная строка END."
+      },
+      { role: "user", content: prompt }
+    ],
+    temperature: 0.2,
+    top_p: 0.9,
+    max_tokens: maxTokens,
+    search_context_size: "low"
+  };
+
+  const res = await fetch(PPLX_API, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${PERPLEXITY_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body),
+    signal
+  });
+
+  const txt = await res.text();
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${txt}`);
+
+  let data = {};
+  try {
+    data = JSON.parse(txt);
+  } catch {
+    throw new Error("Perplexity returned non-JSON response");
+  }
+
+  const content = data?.choices?.[0]?.message?.content || data?.output_text || "";
+  return String(content || "").trim();
+}
+
+/* =======================
+   Prompt
+======================= */
+function buildPrompt(asset) {
+  const styleRule =
+    asset.style === "FX"
+      ? "FX: дифференциал ставок/доходностей, доллар США, аппетит к риску."
+      : "INDEX: реальные ставки/доходности, ожидания по ставкам ФРС, финансовые условия, доллар.";
+
+  return `
+Актив: ${asset.label} (${asset.ticker})
+Горизонт: 3–5 дней
+Режим: Trader
+
+ВАЖНО:
+- Пиши только обычным текстом, без форматирования.
+- Каждый заголовок — строго с новой строки.
+- Перед каждым заголовком (🔥/📊/🎯/⚠️/🧠) ставь пустую строку.
+- Никогда не ставь заголовок в конце строки после текста.
+
+${styleRule}
+
+СТРУКТУРА (строго):
+
+🔥 КЛЮЧЕВЫЕ СОБЫТИЯ
+• 2–3 пункта, по одной строке
+
+📊 МАКРО-КОНТЕКСТ
+• 2–3 ключевых тезиса, по одной строке
+
+🎯 СЦЕНАРИИ
+Base: условие → реакция → причина
+Bull: условие → реакция → причина
+Bear: условие → реакция → причина
+
+⚠️ РИСКИ
+• 3–4 пункта, по одной строке
+
+🧠 TL;DR
+• 2–3 пункта, по одной строке
+
+В конце отдельная строка: END
+`.trim();
+}
+
+/* =======================
+   Structure & cleanup
+======================= */
+function hasEndMarker(s) {
+  const t = String(s || "").trimEnd();
+  return t.endsWith("\nEND") || t.endsWith("END");
+}
+
+function removeEndMarker(s) {
+  let t = String(s || "");
+  t = t.replace(/\nEND\s*$/g, "");
+  t = t.replace(/^END\s*$/g, "");
+  return t.trim();
+}
+
+function mergeContinuation(a, b) {
+  const x = String(a || "").trimEnd();
+  const y = String(b || "").trim();
+  if (!y) return x;
+  return x + "\n" + y;
+}
+
+function cleanText(t) {
+  let out = String(t || "");
+
+  // Remove markdown artifacts
+  out = out.split("**").join("");
+  out = out.split("__").join("");
+  out = out.split("*").join("");
+  out = out.split("`").join("");
+
+  // Remove Perplexity citation markers like [1], [12], etc.
+  out = out.replace(/\[\d+\]/g, "");
+
+  // Normalize spaces & newlines
+  out = out.replace(/\s{2,}/g, " ");
+  out = out.replace(/\n{3,}/g, "\n\n");
+  out = out.trim();
+
+  return out;
+}
+
+function fixStructure(text) {
+  let t = String(text || "");
+
+  const headers = [
+    "🔥 КЛЮЧЕВЫЕ СОБЫТИЯ",
+    "📊 МАКРО-КОНТЕКСТ",
+    "🎯 СЦЕНАРИИ",
+    "⚠️ РИСКИ",
+    "🧠 TL;DR"
+  ];
+
+  // Ensure blank line before headers (if glued to previous sentence)
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i];
+    const re = new RegExp(`([^\\n])\\s*${escapeRegExp(h)}`, "g");
+    t = t.replace(re, `$1\n\n${h}`);
+  }
+
+  // Ensure newline after header
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i];
+    const re = new RegExp(`${escapeRegExp(h)}\\s*`, "g");
+    t = t.replace(re, `${h}\n`);
+  }
+
+  // Make sure bullets start on new lines
+  t = t.replace(/[ \t]*•[ \t]*/g, "• ");
+
+  // Tighten: remove trailing spaces per line
+  t = t
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n");
+
+  // Collapse excessive newlines
+  t = t.replace(/\n{3,}/g, "\n\n").trim();
+
+  return t;
+}
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/* =======================
+   Telegram API
+======================= */
+async function tgSendMessage(chatId, text, keyboard) {
+  const token = globalThis.TELEGRAM_BOT_TOKEN;
+  if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not set");
+
+  return fetch(`${TG_API}${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      parse_mode: PARSE_MODE,
+      disable_web_page_preview: true,
+      reply_markup: keyboard
+    })
+  });
+}
+
+async function tgSendLong(chatId, text) {
+  const parts = splitTelegram(text, 3500);
+  for (let i = 0; i < parts.length; i++) {
+    await tgSendMessage(chatId, parts[i], assetsReplyKeyboard());
+  }
+}
+
+function splitTelegram(text, maxLen) {
+  const out = [];
+  let t = String(text || "");
+
+  while (t.length > maxLen) {
+    let cut = t.lastIndexOf("\n", maxLen);
+    if (cut < 1000) cut = maxLen;
+    out.push(t.slice(0, cut));
+    t = t.slice(cut);
+  }
+  if (t.trim()) out.push(t);
+  return out;
+}
